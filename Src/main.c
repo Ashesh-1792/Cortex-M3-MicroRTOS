@@ -16,70 +16,46 @@
  ******************************************************************************
  */
 
-#include <stdint.h> /*standard integer types gurantees exact bit widths ( eg 32 bits)*/
+#include <stdint.h>
 
 #if !defined(__SOFT_FP__) && defined(__ARM_FP)
   #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
 #endif
 
-/*1. MEMORY AND HARDWARE DEFINITIONS (STM32F102RB NUCLEO BOARD )*/
-
-/*NOTE 1:- THE STACK MSP REGION OR PSP REGIONS ARE FULL DESSCENDING IN NATURE*/
-
+/*MEMORY AND HARDWARE DEFINITIONS */
 #define SRAM_BASE	(0x20000000U)
-#define SRAM_SIZE	((20) * (1024U))/*STM32F103B HAS EXACTLY THE 20KB OF SRAM*/
+#define SRAM_SIZE	((20) * (1024))
 #define SRAM_END	((SRAM_BASE) + (SRAM_SIZE))
 
-/*NOTE 2:- MSP REGION USED FOR INTERRUPT AND EXECPTION EXECUTION IS AT THE TOP OF THE
- * SRAM. */
-
+#define MSP_SIZE	((2) * (1024U))
 #define MSP_BASE	SRAM_END
-#define MSP_SIZE	((2) * (1024U))/*MSP REGION SIZE IS EXACTLY 2KB RESERVED FOR KERNEL CODE
-AND INTERRUPT AND EXCEPTION CODE EXECUTION */
 
+#define TASK_PSP_SIZE	(1024U)
+#define MAX_TASKS	(4U)
 
-#define TASK_PSP_SIZE	(1024U) /*EACH INDIVIDUAL TASK GETS AN EXACT 1KB PRIVATE STACK SPACE
-(PROCESS STACK) TO EXECUTE USER CODE*/
-#define MAX_TASKS 4
+/*FULL DESCENDING STACK PUSH - DECREMENT + PUSH. POP - POP + INCREMENT
+ * MSP REGION | TASK_0_PSP | TASK_1_PSP | .... | TASK_N-1_PSP STACK LAYOUT*/
 
-/*MEMORY LAYOUT BASE ADDRESS OF EACH TASK'S STACK, DESCENDING BELOW THE MSP */
-#define TASK_0_PSP	((MSP_BASE) - (MSP_SIZE)) /*TASK 0 STACK STARTS RIGHT BELOW THE 2KB
-MSP STACK*/
+#define TASK_0_PSP	((MSP_BASE) - (MSP_SIZE))
+#define TASK_1_PSP	(((MSP_BASE) - (MSP_SIZE)) - (1 * TASK_PSP_SIZE))
+#define TASK_2_PSP	(((MSP_BASE) - (MSP_SIZE)) - (2 * TASK_PSP_SIZE))
+#define TASK_3_PSP	(((MSP_BASE) - (MSP_SIZE)) - (3 * TASK_PSP_SIZE))
 
+#define DUMMY_XPSR	(0x01000000U)
+#define TASK_READY	(0U)
+#define TASK_BLOCKED	(1U)
 
-#define TASK_1_PSP	( ((MSP_BASE) - (MSP_SIZE)) - (1 * TASK_PSP_SIZE) )/*TASK 1 STARTS 1 KB
-BELOW THE TASK 0*/
+/*SYSTEM CORE REGISTERS MACROS*/
 
+/*SYSTEM CONTROL BLOCK REGISTERS*/
+#define SCB_ICSR	(*(volatile uint32_t *)0xE000ED04U)
+#define SCB_SHPR2	(*(volatile uint32_t *)0xE000ED1CU)
+#define SCB_SHPR3	(*(volatile uint32_t *)0xE000ED20U)
+#define SYSTICK_CONTROL	(*(volatile uint32_t *)0xE000E010U)
+#define SYSTICK_LOAD	(*(volatile uint32_t *)0xE000E014U)
+#define SYSTICK_VAL	(*(volatile uint32_t *)0xE000E018U)
 
-#define TASK_2_PSP	( ((MSP_BASE) - (MSP_SIZE)) - (2 * TASK_PSP_SIZE) )/*TASK 2 STARTS 1 KB
-BELOW THE TASK 1*/
-
-
-#define TASK_3_PSP	( ((MSP_BASE) - (MSP_SIZE)) - (3 * TASK_PSP_SIZE) )/*TASK 3 STARTS 1 KB
-BELOW THE TASK 2*/
-
-
-#define TASK_READY	(0U)/*STATUS FLAG :- TASK IS READY TO EXECUTE*/
-#define TASK_BLOCKED	(1U)/*STATUS FLAG :- TASK IS SLEEPING (WAITING FOR DELAY TO FINISH)*/
-#define DUMMY_XPSR	(0x01000000U)/*THE 24TH BIT OF THE XPSR REGISTER TO TELL CPU TO EXECUTE
-INSTRUCTIONS IN THUMB2 ISA AND NOT IN ARM*/
-
-
-/*SYSTEM CORE REGISTERS DEREFRENCING THE ADDRESS OF THE REGISTERS TO DIRECTLY ACCESS THE SILICON*/
-
-#define SCB_ICSR	(*(volatile uint32_t *)0xE000ED04U) /*INTERRUPT CONTROL AND STATE REGISTER
-SET BIT 28 TO TRIGGER THE PENDSV_HANDLER*/
-#define SCB_SHPR3	(*(volatile uint32_t *)0xE000ED20U)/*SYSTEM HANDLER PRIORITY REGISTER 3
-TO SET THE PRIORITY OF THE PENDSV AND SYSTICK PRIORITY*/
-#define SYSTICK_CTRL	(*((volatile uint32_t *)0xE000E010U))/*SYSTICK CONTROL:- ENABLES THE HARDWARE
-TIMER AND IT'S INTERRUPT*/
-#define SYSTICK_LOAD     (*((volatile uint32_t *)0xE000E014U))/*SYSTICK RELOAD :- THE COUNTDOWN TIMER
-VALUE FOR 1 MS TIMER.*/
-#define SYSTICK_VAL      (*((volatile uint32_t *)0xE000E018U))/*SYSTICK CURRENT VALUE:- CLEARED TO
-FORCE A FRESH COUNTDOWN.*/
-
-
-/*2. PERIPHERAL REGISTERS :- MEMORY MAPPED I/O FOR CLOCKS AND SERIAL COMMUNICATION*/
+/*MEMORY MAPPED IO MACROS FOR I/O REGISTERS*/
 #define RCC_APB2ENR      (*((volatile uint32_t *)0x40021018U))/*RESET AND CLOCK CONTROL ON APB2 BUS
 ENABLES THE CLOCK FOR GPIO PORT*/
 #define RCC_APB1ENR      (*((volatile uint32_t *)0x4002101CU))/*RESET AND CLOCK CONTROL ON APB1 BUS
@@ -95,146 +71,365 @@ CLOCK TO SET THE TRANSMISSION SPEED*/
 #define USART2_CR1       (*((volatile uint32_t *)0x4000440CU))/*USART2 CONTROL REGISTER 1 TO TURN ON
 THE USART2 */
 
+#define SVC_PENDSV	(0U)
+#define SVC_TASK_YIELD	(1U)
+#define SVC_USART_SEND	(2U)
+#define SVC_TASK_PRIV	(3U)
 
-/*3. RTOS DATA STRUCTURE*/
+/*RTOS DATA STRUCTURES*/
 
-typedef struct{
+//THE TASK CONTROL BLOCK
+typedef struct
+{
+	volatile uint32_t psp_value;
+	void(*task_handler)(void);
+	volatile uint32_t state;
+	volatile uint32_t ticks_to_wait;
+	volatile uint32_t reserved[4]; /*padding to have a TCB of 32 bytes*/
+	}TCB_t;
 
-	uint32_t psp_value; /*offset 0x00. stores the psp stack pointer address the TOP OF STACK
-	where the CPU registers are saved*/
-	void(*task_handler)(void); /*offset 0x04. function pointer to the task handler*/
-	uint32_t state; /*offset 0x08 state of task to track if the task is ready (0) blocked (1)*/
-	uint32_t ticks_to_wait; /*offset 0x0c down counter for how many seconds the task is blocked*/
-	uint32_t reserved[4]; /*Padding so that the TCB_t occupies complete 32 bytes for
-	easier assembly LSL instructions to work-- forcing the TCB_t size to be of multiple of 2^X
-	form*/
-}TCB_t;
+// TASK CONTROL BLOCK ARRAY FOR 4 TASKS
+TCB_t user_tasks[MAX_TASKS];
 
+//variable to hold the current task value
+volatile uint8_t current_task;
+
+//THE CUSTOM DATATYPE FOR MUTEX VARIABLE
 typedef struct{
 
 	volatile uint32_t lock;
+}mutex_t;
 
-}mutex_t;  /*volatile keyword ensures that compiler reads the
-physical memory everytime */
-
-TCB_t user_tasks[MAX_TASKS]; /*An array for 4 TCBs one for each task*/
-uint8_t current_task = 0; /*variable to track the current task*/
-mutex_t usart_mutex = {0}; /*Initializes the printer lock with initial value 0 as unlocked*/
+//THE MUTEX VARIABLE
+mutex_t m = {0};
 
 
+/*important function prototypes*/
+void T0_handler(void);
+void T1_handler(void);
+void T2_handler(void);
+void T3_handler(void);
+void init_usart2_8mhz(void);
+void usart2_print(const char *str);
 
-/*4. SYNCHRONIZATION :- yielding a mutex using LDREX and STREX*/
 
-/*NOTE 3. EXECUTING LDREX ASSOCIATES THE SHARED VARIABLE ADDRESS TO THE LOCAL ACCESS MONITOR
- * AND TAGS IT AS EXCLUSIVE ACCESS. BUT THE SHARED VARIABLE ACCESS LOSES ITS EXCLUSIVR ACCESS TAG
- * IN CASE OF EXCEPTION ENTRY AND EXCEPTION EXIT, INTERRUPTS INCLUDED.*/
+/*SUPERVISOR CALL IMPLEMENTATION */
+void SVC_HANDLER_C(volatile uint32_t *sram_addr);
+
+__attribute__((naked))void SVC_Handler(void)
+{
+			__asm volatile(
+
+					"TST LR, #4 \n"/*perform AND with LR content and 0100 i.e check
+					bit 2 of the LR to know the return thread mode stack PSP or MSP
+					0 - thread mode using MSP = Z flag is set and 1 - thread mode using PSP
+					Z flag is cleared */
+					"ITE EQ \n" /*If then else block based on the EQ equal instruction
+					checking if the Z flag is set or cleared*/
+
+					"MRSEQ R0, MSP \n" /*if Z flag is set it is return to thread mode
+					to MSP*/
+					"MRSNE R0, PSP \n"/*if the Z flag is cleared it is return to thread mode
+					to PSP*/
+
+					"B SVC_HANDLER_C" /*jump to in HANDLER MODE the SVC_HANDLER_C*/
+
+
+			);
+	}
+
+void SVC_HANDLER_C(volatile uint32_t *sram_addr)
+{
+		uint32_t pc_value = sram_addr[6]; /*PC content in the task PSP
+		sits at the offset 0x18 i.e value 24. as follows. R0 offset is 0x00
+		R1 offset is 0x04, R2 offset is 0x08, R3 offset is 0x0C, R12 offset
+		is 0x10, LR offset is 0x14 and PC offset is 0x18. the standard hardware
+		frame*/
+
+		/*extracted the SVC number using the address present in the PC content saved
+		 * by the core in the PSP stack so yes we are directly accessing the PSP
+		 * stack of the task to get the value*/
+		/*as of now pc_value is a scalar value as the address of the next instruciton
+		 * in PC*/
+
+		uint8_t svc_value = ((uint8_t *)pc_value)[-2];
+		/*pc_value is a 32 bit scalar value and SVC call is a 16 bit thumb 2
+		 * isa instruction 0xDF is SVC and then 8 bit immediate value as svc
+		 * value so we type cast the address with access of 8 bits and then
+		 * subtract 2 as in 2 bytes to access the svc value so it is
+		 * as pc_value - (2 * 8)
+		 * possible as uint8_t svc_value = ((uint16_t *)pc_value)[-1]
+		 * here i am type casting the scalar value as 32 bit value so in
+		 * this case we only subtract only as pc_value - (1 *16) */
+
+		//const char *str = (const char *)sram_addr[1]; /*passing the
+			//	string address in R1 REGISTER to send over the USART */
+			//	volatile uint32_t ticks_value = (uint32_t)sram_addr[2];
+
+
+		switch(svc_value)
+		{
+
+		case SVC_PENDSV:
+			SCB_ICSR |= (1U << 28);
+
+				break;
+
+		case SVC_TASK_YIELD:
+
+			user_tasks[current_task].state = TASK_BLOCKED;
+			user_tasks[current_task].ticks_to_wait = sram_addr[0];
+			SCB_ICSR |= (1U << 28);
+
+				break;
+
+		case SVC_USART_SEND:
+			//const char *str = (const char *)sram_addr[0]; /*passing the
+					//string address in R1 REGISTER to send over the USART */
+			usart2_print((const char *)sram_addr[0]);
+
+			break;
+
+		case SVC_TASK_PRIV:
+
+			__asm volatile("MOV R0, #0X02 \n"
+							"MSR CONTROL, R0 \n"); // a backdoor to restore the thread mode
+			//privilege
+
+			break;
+
+		default:
+
+			break;
+		}
+
+	}
+
+
+/*SYNCHRONIZATION AND MUTUAL EXCLUSION IMPLEMENTATION*/
 
 uint32_t hardware_try_lock(volatile uint32_t *lock)
 {
-		uint32_t status = 0; /*to hold the status if the non blocking write to the lock is
-		successfull or not for STREX, 0 indicates success and 1 indicates no write occured */
-		uint32_t value; /*to read in the value of the shared mutex variable used with
-		LDREX instruction*/
+		uint32_t value = 0;
+		uint32_t status;
 
 		__asm volatile(
+				"LDREX %0, [%2] \n" /*load the lock value into GPR
+				& assign the shared lock address a exclusive access tag
+				in the local access monitor */
 
-		"LDREX %0, [%2] \n" /*associates the shared mutex address as exclusive access in locak
-		access monitor and loads the value of shared mutex in the value allocated GPR*/
+				"CMP %0, #0\n" /*compare the value register with 0 and update
+				the Z flag in the APSR. value register - 0 result is discarded
+				if the result is 0 Z is set else it is cleared
+				PURPOSE - to check if the lock is acquired or free*/
 
-		"CMP %0, #0\n" /*Check if the shared mutex is truly unlocked or not. CMP performs
-		allocated value GPR - 0 and updates Z flag of APSR. if Z = 0 then lock was free
-		and if Z = 0 then lock was not free*/
+				"IT EQ \n" /*the if then else block whose execution depends on the
+				EQ instruction attached to Z flag. If Z flag is set --> execute immediate
+				instruction and if Z flag is cleared consider immediate instruction as NOP
+				PURPOSE - if the lock is acquired skip the immediate instruction and return 0*/
 
-		"IT EQ\n" /*IT is if then block which executes based on the instruction EQ based on the
-		content of the Z flag. If Z flag is set execute the immediate block of instruction
-		if the Z flag is clear then skip it label it as NOP*/
+				"STREXEQ %1, %3, [%2] \n" /*STREXEQ suceeds based on 2 parameters
+				shared lock is free lock is 0 i.e Z flag is set and shared lock
+				address has the exclusive access tag. if the write is successfull then
+				it returns 0 or it returns 1. here write numeric 1 to the shared lock
+				it is done by %3 , [%2] and then its status if the write is successfull
+				or not is stored in the %1 operand the status variable*/
 
-		"STREXEQ %1, %3, [%2]\n"/*STREXEQ executes on 2 conditions together. If the Z flag is set
-		and the shared mutex address has the exclusive access if the conditions are met then
-		the %3 operand the constant value 1 is written to the shared mutex and successfull write
-		status 0 is written. if any of the condition fail then status is 1 and the write to
-		the shared mutex failed. */
 
-		: "=&r"(value),"=&r"(status) /*output operands with special =& combination*/
-		: "r"(lock), "r"(1) /*the input operands*/
-		:"cc", "memory"/*clobber list condition and code and memory as warnings to compiler*/
+				: "=&r"(value),"=&r"(status)
+				: "r"(lock),"r"(1)
+				:"cc","memory" /*condition code and memory flags or signals in clobber list*/
+
 		);
-		/*=& for the output operand lists signals the GCC that input and output operands
-		 * require distinct register allocation and no optimization such as reusing the
-		 * registers because 1) for GCC inline assembly is a black box and only operand
-		 * list and clobber list is visible 2) GCC assumes that operands are used as
-		 * i) read the input operand list and allocate registers
-		 * ii) process the registers and assumes input operands are done for
-		 * since GCC cannot read the inline assembly it does not know how the
-		 * operands are used so it assumes input operands are done for
-		 * iii) now allocate registers for output operands
-		 * here the GCC assigns the same register for both the input and the
-		 * output operands as a result a catastrophe
-		 * but =& forces the GCC to allocate distinct registers to input
-		 * and output operands. */
-			return ((value == 0) && (status == 0))? 1 : 0;
+
+
+			return (status == 0 && value == 0) ? 1 : 0;
 	}
 
 void mutex_acquire(mutex_t *m)
 {
 		while(!(hardware_try_lock(&m->lock)))
 		{
-			SCB_ICSR |= (1U << 28); /*if the task fails to acquire the lock then we
-			pendsv handler since there are no other excpetion or interrupt handlers
-			running. the current task is yielded and pendsv_handler selects the next task
-			and loads its context. to not to spin blindly*/
+				__asm volatile("SVC 0x00");
 		}
-			__asm volatile("DMB" :::"memory"); /*this is the acquire barrier. DMB ensures that
-			all the memory access in the critical section are not allowed to float upwards. Also
-			 known as the Ceiling barrier. DMB ENFORCES THE ORDERING OF MEMORY ACCESS AROUND
-			 ITS BARRIERS.*/
+			__asm volatile("DMB" :::"memory");
 	}
 
 void mutex_release(mutex_t *m)
 {
-		__asm volatile("DMB":::"memory");/*the floor barrier or the release barrier ensures that
-		no memory accesses in the critical section drop beneath this barrier*/
+		__asm volatile("DMB" ::: "memory");
 			m->lock = 0;
 	}
 
 
-void task_delay(uint32_t ticks)
+/*CONTEXT SWITHCING AND INITIAL PROCESS BOOT FUNCTIONS */
+__attribute__((naked))void PendSV_Handler(void)
 {
-		if(ticks == 0)
-				return;
-		else
-		{
-				__asm volatile("CPSID I"); /*CPSID stands of Change Processor State Interrupt
-				Disable and I is flag for PRIMASK register---> sets the PRIMASK bit disabling
-				exceptions and interrupts with configurable priority except NMI interrupts
-				and Hardfault. so even systick and pendsv handler is disabled.*/
+				__asm volatile(
 
-				user_tasks[current_task].state = TASK_BLOCKED;
-				user_tasks[current_task].ticks_to_wait = ticks;
+						".align 2 \n"
+						/*save the software frame of the outgoing task*/
 
-				__asm volatile("CPSIE I");/*Change processor state interrupts enable
-				clears the PRIMASK enabling all the interrupts*/
+						"MRS R0, PSP \n"
+						"STMDB R0!, {R4-R11 }\n" /*STORE MULTIPLE DECREMENT BEFORE
+						pushed 32 bytes of register content in push + decrement operation
+						so R0 - 32 is updated using ! write back operator. R0 now points
+						to the bottom of the software frame in the PSP of the outgoing task*/
 
-				SCB_ICSR |= (1U << 28); /*pend the pendsv handler to select the
-				next task for execution yielding the current one*/
+						/*update the TOP OF STACK TOS value in the TCB of the
+						 * outgoing task*/
 
-				/*WHY ? The Systick handler decrements the tasks tick for each task after
-				 * every 500 ms and so task_delay and systick_handler both access the
-				 * TCB_t for every task and since the competing function for TCB
-				 * apart from the task_delay is an exception handler we must
-				 * disable the exceptions and interrupts so that task_delay can access
-				 * TCB members without race condition corrupting the data*/
+						// find the current task number to access its TCB
 
-		}
+						"LDR R2, =current_task \n" /*=immediate value or =var_name
+						stores the 32 bit address or the immeidate_value in a literal
+						pool in the flash memory at an address near the current instruction
+						and uses the PC to add the relative offset and load the content
+						into the R2 -- PC RELATIVE OFFSET LITERAL POOL because thumb 2
+						ISA cannot store an entire 32 bit value when max instruction
+						length is 32 bit itself*/
+
+						"LDRB R2, [R2] \n" /*loads one byte of data from sram address to R2
+						sram address present in R2*/
+
+						"LDR R1, =user_tasks \n" /*load the base address of the TCB_t
+						array to R1 using the PC RELATIVE OFFSET LITERAL POOL METHOD*/
+
+						/*calculate the offset to access the element in
+						 * the tcb array*/
+						"ADD R3, R1, R2, LSL #5 \n" /*each tcb is 32 bytes wide therefore
+						we need to calculate the address as user_tasks + (current_task * 32)
+						which is achieved as R3 = R1 + ( R2 << 5) as LSL is logical shift
+						left R2 << 5 means current_task * 5. so we are storing the base
+						address of the TCB of the outgoing task in R3*/
+
+						"STR R0, [R3] \n" /*since psp_value is the very first element
+						of the TCB derefrencing the base address of current_task tcb also
+						provides access to the psp_value as it is same address as base
+						address of the first member. with this we have updated the
+						TOS value of the outgoing task PSP into the tcb*/
+
+						/*SEARCH FOR THE NEW TASK WHOSE STATE IS READY*/
+
+						"MOV R3, R2 \n" /*copy the current_task value present in R2 to R3*/
+
+						"FIND_READY_TASK: \n"
+
+						/*increment the current_task value as : current_task +1 % 4*/
+						"ADD R3, R3, #1 \n"
+						"AND R3, R3, #0X03 \n" /*R3 & 0011 acts same as % 4
+						works only for mod 2^X values for x > 0*/
+
+						/*with the incremented current value access the tcb of the
+						 * current task and check if it has a ready state or not*/
+						"\n ADD R0, R1, R3, LSL #5 \n" /*R0 =  user_tasks +
+						(current_task * 32)*/
+
+						"LDR R4, [R0, #0X08] \n" /*the offset of each member of the TCB is
+						psp_value is at offset 0x00, void (*task_handler)(void) is at
+						offset at 0x04, state is at offset 0x08 and ticks_to_wait is at
+						offset 0x0c. [R0, #0x08] means *( R0 + 8bytes) we load the state
+						value into the R4*/
+
+						"CMP R4, #0X00 \n" /*essentially R4 - 0 and modify Z flag and discard
+						the result. z flag is set R4 is 0 task is ready
+						else R4 is 1 task blocked*/
+
+						"BNE FIND_READY_TASK \n" /*loop back to the label if the Z
+						flag is cleared as NE stands for NE and both NE and EQ
+						are associated with the Z flag*/
+
+						/*update the current_task with the readty task
+						 * task number*/
+
+						"LDR R4, =current_task \n"/*R4 reused*/
+						"STRB R3, [R4] \n" /*current_task updated*/
+
+						/*LOAD THE READY TASK SOFTWARE FRAME */
+
+						// require the psp_value of ready task to restore
+						//from its PSP
+
+						"ADD R0, R1, R3, LSL #0X05 \n" /*base address of tcb of the
+						current task*/
+
+						"LDR R0, [R0] \n"/*load TOS value into R0 only*/
+
+						"LDMIA R0!, {R4-R11} \n"/*LOAD MULTIPLE INCREMENT
+						AFTER. loading from PSP to the cpu registers this is POP
+						R0 is updated as R0+32 as ! write back operator and R0 is
+						now at base of the hardware frame of the new task*/
+
+						"MSR PSP, R0 \n"
+
+						"LDR LR, =0XFFFFFFFD \n"
+
+						"BX LR \n" /*branch indirect to execure in thread mode
+						the exception exit. automatically restores the hardware frame*/
+ 				);
 	}
 
+void init_tasks_stack(void)
+{
+		/*update the task_handler pointer to function in the TCB of each task*/
+		user_tasks[0].task_handler = T0_handler;
+		user_tasks[1].task_handler = T1_handler;
+		user_tasks[2].task_handler = T2_handler;
+		user_tasks[3].task_handler = T3_handler;
+
+		/*a temporary array to hold the TOS values*/
+		uint32_t TOS_arr[MAX_TASKS] = {TASK_0_PSP, TASK_1_PSP, TASK_2_PSP,
+		TASK_3_PSP};
+
+			for(uint8_t i = 0; i<MAX_TASKS; i++)
+			{
+				uint32_t *pPSP = (uint32_t *)TOS_arr[i];
+
+				user_tasks[i].state = TASK_READY;
+				user_tasks[i].ticks_to_wait = 0;
+
+				/*HARDWARE FRAME XPSR, PC, LR, R12, R3, R2, R1, R0*/
+
+				pPSP--;*pPSP = DUMMY_XPSR; // XPSR
+
+				pPSP--; *pPSP = ((uint32_t)user_tasks[i].task_handler) | 1U; //PC
+
+				pPSP--; *pPSP = 0xFFFFFFFDU; // LR
+
+				pPSP--; *pPSP = 0xccccccc0U | i; //R12
+
+				pPSP--; *pPSP = 0x33333330U | i; //r3
+
+				pPSP--; *pPSP = 0x22222220U | i; //r2
+
+				pPSP--; *pPSP = 0x11111110U | i; // r1
+
+				pPSP--; *pPSP = 0x00000000U | i; //r0
+
+				/*SOFTWARE FRAME R11 TO R4 */
+				pPSP--; *pPSP = 0xBBBBBBB0U | i; // r11
+				pPSP--; *pPSP = 0xAAAAAAA0U | i; //r10
+				pPSP--; *pPSP = 0x99999990U | i;//r9
+				pPSP--; *pPSP = 0x88888880U | i;//r8
+				pPSP--; *pPSP = 0x77777770U | i;//R7
+				pPSP--; *pPSP = 0x66666660U | i;//R6
+				pPSP--; *pPSP = 0x55555550U | i;//r5
+				pPSP--; *pPSP = 0x44444440U | i;//r4
+
+				user_tasks[i].psp_value = (uint32_t)pPSP;
+
+			}
+	}
+
+
+/*the systick handler performs 2 functions. decrements the ticks
+ * while the task remains blocked and if the ticks become 0
+ * wake the tasks up and triggers the pendsv handler*/
 void SysTick_Handler(void)
 {
-		for(uint32_t i = 0; i < MAX_TASKS; i++)
+		for(uint8_t i = 0; i<MAX_TASKS; i++)
 		{
-			/*if the task is still blocked and it's timer is still greater than 0
-			 * theh simply decrement the ticks*/
-			if(user_tasks[i].state == TASK_BLOCKED && user_tasks[i].ticks_to_wait > 0)
+			if((user_tasks[i].state == TASK_BLOCKED ) && (user_tasks[i].ticks_to_wait > 0))
 			{
 				user_tasks[i].ticks_to_wait--;
 			}
@@ -243,288 +438,99 @@ void SysTick_Handler(void)
 			{
 				user_tasks[i].state = TASK_READY;
 			}
+
 		}
-			SCB_ICSR |= (1U << 28); /*trigger the PendSV handler to execute a new task
-			which is ready.*/
+		SCB_ICSR |= (1U << 28); /*systick handler is executed in handler mode
+						so we do not need svc call to access the Interrupt control and state
+						register*/
 	}
 
-
-/*VERY IMPORTANT -- MUST INITIALIZE THE PSP STACKS OF EACH TASK WHICH IMPORTANT
- * AND DUMMY DATA*/
-void task_0_handler(void);
-void task_1_handler(void);
-void task_2_handler(void);
-void task_3_handler(void);
-
-void init_tasks_stack(void)
-{
-		/*the task handler address for each of the TCB*/
-		user_tasks[0].task_handler = task_0_handler;
-		user_tasks[1].task_handler = task_1_handler;
-		user_tasks[2].task_handler = task_2_handler;
-		user_tasks[3].task_handler = task_3_handler;
-
-
-		/*An array to hold the top of the psp stack address for each task*/
-		uint32_t task_TOS[MAX_TASKS] = {TASK_0_PSP, TASK_1_PSP, TASK_2_PSP, TASK_3_PSP};
-
-		/*now we use the PSP TOS values of each task and populate the psp*/
-			for(uint32_t i = 0; i<MAX_TASKS; i++)
-			{
-					/*set the initial state as ready and ticks to 0 */
-				user_tasks[i].state = TASK_READY;
-				user_tasks[i].ticks_to_wait = 0;
-				uint32_t *pPSP = (uint32_t *)task_TOS[i]; /*temporary pointer to populate
-				PSP using the task wise TOS value*/
-
-				/*HARDWARE FRAME -- R0, R1, R2, R3, R12, LR, PC, XPSR*/
-				pPSP--; *pPSP = DUMMY_XPSR; /*THE XPSR CONTENT*/
-
-				pPSP--; *pPSP = ((uint32_t)user_tasks[i].task_handler) | 1U; /*PC content
-				ENSURES THAT FUNCTION CALL IS ALIGNED WITH THE TBIT HENCE BIT 0 SET*/
-
-				pPSP--; *pPSP = 0xFFFFFFFDU; /*LR EXC_RETURN value to return to thread mode
-								using PSP from handler mode*/
-
-				/*populate the GPRs with dummy value*/
-				pPSP--; *pPSP = (0x12121200U | i); /*R12 content*/
-				pPSP--; *pPSP = (0x03030300U | i); /*R3 content*/
-				pPSP--; *pPSP = (0x02020200U | 	i);/*R2 content*/
-				pPSP--; *pPSP = (0x01010100U | i);/*R1 content*/
-				pPSP--; *pPSP = (0x00000000U | i);/*R0 content*/
-				/*THE HARDWARE FRAME POPULATION ENDS*/
-
-				/*POPULATE THE SOFTWARE FRAME - R4 TO R11*/
-				pPSP--; *pPSP = (0xBBBBBBB0U | i);/*R11 content*/
-				pPSP--; *pPSP = (0xAAAAAAA0U | i);/*R10 content*/
-				pPSP--; *pPSP = (0x99999990U | i);/*R9 content*/
-				pPSP--; *pPSP = (0x88888880U | i);/*R8 content*/
-				pPSP--; *pPSP = (0x77777770U | i);/*R7 content*/
-				pPSP--; *pPSP = (0x66666660U | i);/*R6 content*/
-				pPSP--; *pPSP = (0x55555550U | i);/*R5 content*/
-				pPSP--; *pPSP = (0x44444440U | i);/*R4 content*/
-
-				/*update the TOS value*/
-				user_tasks[i].psp_value = ((uint32_t)pPSP);
-
-			}
-	}
-
-
-/*VERY IMPORTANT*/
-__attribute__((naked))void PendSV_Handler(void)
-{
-		__asm volatile(
-				".align 2 \n" /*Aligns the entire inline assembly block to a 4 byte memory boundary
-				as per the ARM compliance*/
-
-				/*Saving the software frame of the outgoing task. The Hardware frame of the
-				 * outgoing task is automatically saved by the core onto the PSP stack of
-				 * the task so the PSP register is updated with the TOS stack at the base
-				 * of the hardware frame*/
-
-				"MRS R0, PSP \n" /*MRS - move special function register content to a general
-				purpose register content*/
-
-				/*SAVE THE OUTGOING TASK SOFTWARE FRAME*/
-
-				"STMDB R0!, {R4-R11} \n" /*STMDB IS STORE MULTIPLE DECREMENT BEFORE.
-				PUSH in full descending stack is decrement and then push. So here we are going
-				to push 8 registers contents R4-R11 onto the outgoing task PSP stack
-				8 register * 4 bytes each is 32 bytes so the final value in the R0 will be
-				R0 - 32. Note since this is FD we are moving from higher address range to
-				lower address range, "i" here serves as the write back operator updating R0
-				as R0 - 32. As of now the R0 points to the bottom of the software frame in the
-				PSP of the outgoing task PSP region --> THE TOP OF STACK VALUE.*/
-
-				/*UPDATE THE TOP OF STACK VALUE OF OUTGOING TASK IN ITS TCB*/
-
-				"LDR R2, =current_task \n"/*As we know that ARM m3 executes in thumb2
-				ISA therefore it is diffcult to accomodate an entire 32 bit address
-				into a 16bit or 32 bit length instruction therefore the core allocates
-				a 32 bit memory in the FLASH memory near where this instruction is stored
-				known as the memory pool or literal pool. Therefore the 32 bit address of
-				the global variable current_task is stored in the pool. PC contains the address
-				of the next inline assembly instruction so we use that value and add an offset to
-				load this value into R2 register. so the instruction looks as follows
-				LDR R2, [PC, #OFFSET]*/
-
-				"LDRB R2, [R2] \n" /*LDR is a Load instruction load from memory to GPR
-				LDRB stands for load only 1 byte of data it is as follows
-				R0 = (*(uint8_t *)(&current_task)) as current_task is only a uint8_t variable*/
-
-				/*R2 HAS THE CURRENT_TASK NUMBER*/
-
-				" LDR R1, =user_tasks \n" /*similarly load the base address of the TCB array to
-				R1 using = operator for PC relative offset*/
-
-				"ADD R3, R1, R2, LSL #5 \n"
-				"STR R0,[R3] \n"/*[Rm, Rn] means *(Rm + Rn).
-				[R1 + (R2 << 5)] LSL is logical shift left. now R2 is current_task
-				value and R1 is the base address of TCB array and each TCB is of 32 bytes
-				therefore the interpretation is (user_tasks[current_task])
-				i.e user_tasks + (current_task * 32) as logical shift left
-				by n bit is multiplication with 2^n. The interpretation is
-				user_tasksc[current_task].psp_value = R0 why because psp_value
-				is the very first memeber of the TCB and the base address of TCB_t
-				is also the base address of the first member. so we have updated the
-				TOS value of the outgoing task */
-
-
-
-
-				/*SEARCH FOR THE NEXT READY TASK*/
-
-				"MOV R3, R2\n" /*move the current task number to R3 to search for next ready
-				task*/
-
-				"FIND_READY_TASK :\n" /*this is a label*/
-
-				" ADD R3, R3, #1 \n" /*incrementing the current_task number*/
-
-				"AND R3, R3, #0X03 \n" /*in decimal arithmetic the increment is as
-				current_task  = (current_task + 1)%4 and in binary arithmetic % is used as
-				if the given modulo value is in 2^x format then it is as
-				current_task = (current_task + 1) & (X-1) in this case there are 4 tasks
-				so it is & with 3.*/
-
-				"ADD R0, R1, R3, LSL #5 \n" /*we are reusing the R0 register here to find
-				the base address of the TCB of the next task.
-				R0 = (R1 + (R3 << 5)) this is R0 = (user_tasks + (current_task * 32))
-				R0 now holds the base address of the TCB of the next task so we can say it is
-				&user_tasks[current_task]*/
-
-				"LDR R4, [R0, #0X08] \n" /*We know that state of the task is a member
-				of the TCB and it is present at the offset 0x08 so we add 8 bytes to the
-				&user_tasks[current_task] to access the state variable and then dereference
-				it to get the current state of the task so R0 = *(&user_tasks[current_task] + 8))
-				if the state is TASK_READY we load the software frame of that task and if the
-				state is TASK_BLOCK we loop back to the label FIND_READY_TASK*/
-
-				"CMP R4, #0X00 \n" /*CMP instruction performs R4 - 0 and updates the Z flag
-				of APSR of xPSR and discards the result. Observe in the code TASK_READY is
-				labelled as 0 and TASK_BLOCKED is labelled as 1, so if the task is ready
-				then Z flag is set else cleared.*/
-
-				"BNE FIND_READY_TASK \n" /*BNE is a conditional branch instruction
-				which depends on NE tied to Z flag. If the Z flag is set BNE fails
-				but if Z flag is clear NE succeeds and we loop back to find the
-				next task with ready state*/
-
-				/*UPDATE THE current_task variable with the ready state
-				 * task number*/
-
-				" LDR R4, =current_task \n" /*Using the same PC relative offset
-				literal pool method to store the 32 bit address of the current_task
-				address */
-
-				"STRB R3, [R4] \n" /*Must update the new value of the ready task to
-				current_task. STRB is store one byte to the address of the current_task
-				since current_task is an uint8_t variable*/
-
-
-				/*RESTORE THR SOFTWARE FRAME OF THE READY TASK BACK TO CPU
-				 * FROM READY TASK PSP*/
-
-				"ADD R0, R1, R3, LSL #5 \n"
-				"LDR R0, [R0] \n"/*recall R1 holds the base address
-				of the user_tasks and R3 holds the current_task value so we load
-				the psp_value the TOS value of ready task PSP to the R0
-				R0 = user_tasks[current_value].psp_value. since the base address of the
-				TCB of the ready task is also base address of the very first member
-				of the TCB*/
-
-				"LDMIA R0!,{R4-R11} \n" /*LDMIA LOAD MULTIPLE INCREMENT AFTER. As of now
-				the TOS value for ready task is at the bottom the software frame pointing at
-				the cell of R0 we are loading from PSP to CPU registers so this is POP
-				POP = POP + increment hence we are going to move from lower address range
-				to higher address range. 8 cells are popped each of 4 bytes to
-				R0 = R0 + 32 and "!" operator ensures that R0 is updated with R0+32*/
-
-				"MSR PSP, R0 \n" /*update the TOS now at the bottom of the hardware frame
-				pointing at cell R0 in ready task PSP*/
-
-				"LDR LR, =0XFFFFFFFD \n" /*Using the same PC relative offset and
-				literal pool to store the 32 bit constant value. 0xFFFFFFFD is the exc_return
-				value used during the exception exit which tells the cpu core to use PSP
-				register for thread mode as we can see PSP register is updated with the
-				TOS value of ready task PSP so it will access the ready task PSP*/
-
-				"BX LR \n" /*BX BRANCH indirect based on the register content. We are triggering
-				the exception and based on the AAPCS ARM ARCHITECTURE PROCEDURE CALL
-				STANDARD the software frame is saved by code written in the pendsv handler and
-				hardware frame is saved by the cpu similary software frame is restored by the
-				user code in pendsv handler and hardware frame is restored by the cpu core*/
-
-		);
-
-	}
-
-/*must explicitly launch task 0 BECAUSE PENDSV EXECUTES WITH ASSUMPTION THAT THE TASKS
- * HAVE BEEN EXECUTED ONCE AND PREEMPTED THEREFORE WE MUST EXPLICITLY EXECUTE A TASK*/
+/*PENDSV HANDLER EXECUTES WITH AN ASSUMPTION THAT EACH TASK HAS BEEN EXECUTED ONCE SO
+ * FOR IT THERE IS ALWAYS A CONTEXT SWITCH HENCE WE EXPLICITLY BEGIN THE TASK 0
+ * EXECUTION */
 __attribute__((naked))void launch_task_0(void)
 {
 		__asm volatile(
+				/*this code is executed in thread mode with msp in PRIVILEGED ACCESS
+						 * SINCE THIS IS IN THREAD MODE MUST MANUALLY LOAD THE SOFTWARE AND
+						 * THE HARDWARE FRAME. INITIALLY THE TOS VALUE FOR EACH TASK IS AT
+						 * THE BOTTOM OF THE SOFTWARE FRAME IN THE PSP*/
 
-				/*Read in the base address of user_tasks in R0*/
-				"LDR R0, =user_tasks \n"
-				"LDR R0, [R0] \n"
+							"LDR R0, =user_tasks \n"
+							"LDR R0, [R0] \n" /*the PSP value of tcb of task 0 */
 
-				/*TOS for Task 0 is bottom of the software frame in PSP
-				 * pop the software frame to cpu registers*/
-				"LDMIA R0!, {R4-R11} \n" /*because of ! write back the R0 is R0+32
-				as 8 register content each of 4 bytes.*/
+							"LDMIA R0!, {R4-R11} \n" /*Load the software frame popping
+							so R0 is updated with R0 + 32. TOS is bottom of the hardware frame*/
 
-				/*Update the SP pointer the banked PSP register*/
-				"MSR PSP, R0 \n"
+							/*MUST RESTORE HARDWARE FRAME MANUALLY. CANNOT RESTORE XPSR IN THREAD
+							 * MODE. IT IS ONLY HANDLED BY HANDLER MODE HENCE FOR TASKS 1, 2 AND 3
+							 * WE ARE STORING IT IN ITS PSP HERE WE ALREADY ARE IN THREAD MODE
+							 * WITH T BIT SET AND THE TASK_0_HANDLER ALREADY HAS A BIT 0 SET
+							 * FOR THE T BIT */
+							"MSR PSP, R0\n" /*updated with new TOS in the current SP*/
 
-				/*SET THE CONTROL BIT 1 SP SEL BIT STACK POINTER SELECT BIT AS 1
-				 * SO THAT THREAD MODE TASKS USE PSP STACK THEIR OWN INSTEAD OF
-				 * MSP BEGINNING WITH TASK 0 EXECUTION*/
-				"MOV R0, #0X02 \n"
-				"MSR CONTROL, R0 \n"
+							/*set the CONTROL BIT 1 SPSEL BIT FOR THREAD MODE TO USE PSP
+							 * SET THE CONTROL BIT 0 NPRIV FOR NON PRIV THREAD MODE IN PSP*/
+							"MOV R0, #0X03 \n"
+								/*AT THIS POINT THREAD MODE WAS PRIVILEGED USING MSP*/
+							"MSR CONTROL, R0\n"
+							/*FROM NOW ON THREAD MODE IN NON PRIV MODE USING PSP */
 
-				/*INSTRUCTION SYNCHRONIZATION BARRIER. ISB up until now the instruction
-				 * execution has occured in thread mode with MSP. the ARM core pipeline
-				 * has multiple instructions fetched already for the FETCH-DECODE-
-				 * -EXECUTE cycle. Hence despite the CONTROL SPSEL BIT 1 the subsequent
-				 * instructions such as POP {r0-r3,r12,LR} and so on pose a potential
-				 * risk of executing off of the MSP stack instead of the PSP stack
-				 * because these instructions were in the FDE cycle a chance that
-				 * these fetched instructions do not execute with the updated
-				 * architectureal difference the SPSEL bit action. Hence ISB
-				 * forces to flush the pipeline and again fetch all the instrucitons
-				 * so that the effect of SPSEL bit is refelcted in the subsequent
-				 * in the subsequent instructions and PSP is used.*/
+							"ISB \n" /*INSTRUCTION SYNCHRONIZATION BARRIER. M3 CORE
+							WORKS AS FETCH-DECODE-EXECUTE CYCLE SO IT FETCHES INSTRUCTIONS
+							AHEAD WHILE DECODING FEW INSTRUCTIONS AT THE SAME TIME FEW
+							INSTRUCTIONS ALREADY UNDER EXECUTION SO IF THE INSTRUCTIONS
+							POST MSR CONTROL , R0 ARE ALREADY FETCHED AND DECODED AND
+							BEGIN EXECUTION BEFORE THE CONTROL MODIFICATION TAKE ITS
+							EFFECT THE SUBSEQUENT INSTRUCTIONS INVOLVING POP MUGHT EXECUTE
+							USING MSP AND NOT TASK_0 PSP IN THE ABSENCE OF ISB. WITH
+							ISB IT FLUSHES THE PIPELINE AND RE FETCHES ALL THE INSTRUCTIONS
+							SO THAT CONTROL MODIFICATION TAKES PLACE*/
 
-				"ISB \n"
+							"POP {R0-R3,R12,LR} \n" /*YES THE CURRENT SP IS UPDATED
+							AND POINTS TO THE PC CONTENT */
 
-				"POP {R0-R3, R12, LR}\n" /*IMPORTANT :- launch_task_0 is being executed
-				in thread mode and not in handler mode so the hardware frame shall not
-				be automatically popped from the task 0 PSP to the cpu registers
-				must pop them manually, because of set SPSEL bit POP directly uses
-				the PSP SP banked pointer. with PSP now pointing to the PC content
-				in the PSP of the task 0 as TOS value*/
+							"POP {R0} \n" /*POPPING THE ADDRESS  T0_Handler | 1U
+							into R0. SO WHY NOT RESTORE THE PC CONTENT INTO THE PC
+							WELL THIS IS THREAD MODE CODE SO PC IS POINTING  TO THE
+							NEXT ASSEMBLY INSTRUCTION TO BE EXECUTED */
 
-				"POP {R0} \n" /*POP the PC content the task_0_handler | 1U value the
-				32 bit address into the R0 GPR. PSP now points to the xPSR content in the PSP*/
+							"ADD SP, SP, #4 \n" /*SKIPPING THE XPSR CONTENT
+							BECAUSE THREAD MODE IN PSP WITH NPAL CANNOT ACCESS IT
+							EXCEPT MSR OR MRS AND IT IS ONLY ACCESSED BY THE HANDLER
+							MODE. SINCE HANDLER MODE RESTORES THE TASKS 1, 2 AND 3
+							HARDWARE CONTEXT IT ACCESSES THE XPSR.*/
 
-				"ADD SP, SP, #4 \n"/*We skip over the xPSR content as it is a protected
-				register from software composite of EPSR , APSR and IPSR and only
-				the core accesses it by extracting the bit 0 from the task_0_handler | 1U
-				the bit 0 to set the T bit hence we cannot access this register
-				but since rest of the tasks are not explictly launched we play a
-				trick on the ARM we load the xPSR content is 0x01000000U in the PSP
-				regions of each task and since PENDSV believes that each task
-				has already executed once restores the hardware frames  for us
-				hence tasks 1, 2 and 3 have their own T bit set */
-
-				"BX R0 \n" /*BX task_0_handler launch the task 0*/
+							"BX R0 \n" /*launch the T0_handler*/
 
 		);
-
 	}
 
+int main(void)
+{
+	/*set the priority of the SVC handler and systick. since both of them
+	 * access the tcb to update the state and modify the ticks_to_wait
+	 * reached one conclusion keep their priorities completely same*/
+
+	SCB_SHPR3 |= (0x80 << 24) | (0xFF << 16); // this is pendsv priority lowest
+
+	SCB_SHPR2 |= (0x80 << 24 );
+
+	/*CONFIGURE THE SYSTICK HANDLER*/
+	SYSTICK_LOAD = 8000-1;
+	SYSTICK_VAL = 0;
+	SYSTICK_CONTROL = (1U << 2) | (1U << 1) | (1U << 0);
+
+	init_tasks_stack();
+
+	init_usart2_8mhz();
+
+	launch_task_0();
+
+
+    /* Loop forever */
+	for(;;);
+}
 
 /*BARE METAL USART2 DRIVER CODE*/
 void init_usart2_8mhz(void)
@@ -545,7 +551,7 @@ void init_usart2_8mhz(void)
 
 	}
 
-void usart_print(const char *str) {
+void usart2_print(const char *str) {
     while (*str) { /* Loops through the string array until it hits the null terminator '\0' */
         while (!(USART2_SR & (1U << 7))); /* Blocks CPU execution until the TXE (Transmit Empty) flag turns 1 */
         USART2_DR = (*str++ & 0xFF); /* Pushes one 8-bit character into the hardware transmission buffer and increments the pointer */
@@ -553,58 +559,103 @@ void usart_print(const char *str) {
 }
 
 
-int main(void)
+/*each task stores 2 things :- 1) the base address of the string literal
+ * 2) the task yield value based on the current task */
+
+void T0_handler(void)
 {
-	/* Set PendSV to lowest priority (0xFF) so it doesn't interrupt vital hardware timers */
-	    SCB_SHPR3 |= (0xFFU << 16);
+	volatile uint32_t t0_yield_value = 500;
+		while(1)
+		{
+			mutex_acquire(&m);
 
-	    init_usart2_8mhz(); /* Boot up the serial hardware */
-	    init_tasks_stack(); /* Pre-load the stack frames with function addresses */
+			const char *task0_string = "THIS IS TASK 0\r\n"; // a string literal constant
+		//	__asm volatile(
 
-	    /* SysTick configuration: 8000 ticks = 1ms at default 8MHz HSI clock */
-	    SYSTICK_LOAD = 8000 - 1; /* Sets countdown value */
-	    SYSTICK_VAL  = 0; /* Clears current timer */
-	    /* Bit 2 = CPU Clock Source, Bit 1 = Enable Interrupt, Bit 0 = Enable Timer */
-	    SYSTICK_CTRL = (1U << 2) | (1U << 1) | (1U << 0);
-
-	    launch_task_0(); /* Fire the ignition sequence to start the OS */
-
-	for(;;);
-}
+					//			"MOV R1, %0 \n" /*load the string base address */
+						//		"MOV R2, %1 \n"/*load the custom ticks value*/
+						//		"SVC #0X02\n"/*supervisor call to access usart*/
+							//	::"r"(task0_string),"r"(t0_yield_value)
+					//	);
+			__asm volatile("MOV R0, %0 \n"
+								"SVC #0X02 \n"
+								::"r"(task0_string):"memory");
 
 
-void task_0_handler(void) {
-    while(1) { /* Tasks must never return; they run in infinite loops[cite: 1]. */
-        mutex_acquire(&usart_mutex); /* Claim hardware lock before touching the serial port[cite: 1]. */
-        usart_print("[T0] This is task 0 handler accessing usart2\r\n"); /* Transmit text[cite: 1]. */
-        mutex_release(&usart_mutex); /* Release lock for others[cite: 1]. */
-        task_delay(1000); /* Sleep for 500ms, yielding CPU to Task 1[cite: 1]. */
-    }
-}
 
-void task_1_handler(void) {
-    while(1) {
-        mutex_acquire(&usart_mutex);
-        usart_print("[T1] This is task 1 handler accessing usart2\r\n");
-        mutex_release(&usart_mutex);
-        task_delay(3000); /* Sleeps for 750ms[cite: 1]. */
-    }
-}
+						mutex_release(&m);
+						__asm volatile("MOV R0, %0 \n"
+								"SVC #0X01 \n"
+								::"r"(t0_yield_value):"memory");
+		}
+	}
 
-void task_2_handler(void) {
-    while(1) {
-        mutex_acquire(&usart_mutex);
-        usart_print("[T2] This is task 2 handler accessing usart2\r\n");
-        mutex_release(&usart_mutex);
-        task_delay(6000); /* Sleeps for 1000ms[cite: 1]. */
-    }
-}
 
-void task_3_handler(void) {
-    while(1) {
-        mutex_acquire(&usart_mutex);
-        usart_print("[T3] This is task 3 handler accessing usart2\r\n");
-        mutex_release(&usart_mutex);
-        task_delay(1000); /* Sleeps for 1250ms[cite: 1]. */
-    }
-}
+void T1_handler(void)
+{
+	volatile uint32_t t1_yield_value = 750;
+		while(1)
+		{
+			mutex_acquire(&m);
+
+			const char *task1_string = "THIS IS TASK 1\r\n";
+
+			__asm volatile("MOV R0, %0 \n"
+					"SVC #0X02 \n"
+					::"r"(task1_string):"memory");
+
+
+
+			mutex_release(&m);
+			__asm volatile("MOV R0, %0 \n"
+					"SVC #0X01 \n"
+					::"r"(t1_yield_value):"memory");
+
+		}
+	}
+
+
+void T2_handler(void)
+{
+	volatile uint32_t t2_yield_value = 1000;
+		while(1)
+		{
+			mutex_acquire(&m);
+
+			const char *task2_string = "THIS IS TASK 2\r\n";
+
+			__asm volatile("MOV R0, %0 \n"
+								"SVC #0X02 \n"
+								::"r"(task2_string):"memory");
+
+
+
+						mutex_release(&m);
+						__asm volatile("MOV R0, %0 \n"
+								"SVC #0X01 \n"
+								::"r"(t2_yield_value):"memory");
+		}
+	}
+
+
+void T3_handler(void)
+{
+	volatile uint32_t t3_yield_value = 1250;
+		while(1)
+		{
+			mutex_acquire(&m);
+
+			const char *task3_string = "THIS IS TASK 3\r\n";
+
+			__asm volatile("MOV R0, %0 \n"
+								"SVC #0X02 \n"
+								::"r"(task3_string):"memory");
+
+
+
+						mutex_release(&m);
+						__asm volatile("MOV R0, %0 \n"
+								"SVC #0X01 \n"
+								::"r"(t3_yield_value):"memory");
+		}
+	}
